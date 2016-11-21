@@ -1416,6 +1416,13 @@ public:
             it->second -= 1;
             if (it->second <= 0)
             {
+                if (it->first->pPublicPtr != NULL)
+                {
+                    // We can now release the last public ptr since maximum latency frames have passed
+                    it->first->pPublicPtr->Release();
+                }
+
+                // Swap out the pointer and remove it from the commit queue
                 it->first->pPublicPtr = it->first->pInternalPtr;
                 mRootSignatureCommitQueue.erase(it);
             }
@@ -1431,6 +1438,13 @@ public:
             it->second -= 1;
             if (it->second <= 0)
             {
+                if (it->first->pPublicPtr != NULL)
+                {
+                    // We can now release the last public ptr since maximum latency frames have passed
+                    it->first->pPublicPtr->Release();
+                }
+
+                // Swap out the pointer and remove it from the commit queue
                 it->first->pPublicPtr = it->first->pInternalPtr;
                 mPipelineCommitQueue.erase(it);
             }
