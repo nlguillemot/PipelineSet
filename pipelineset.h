@@ -107,6 +107,7 @@ public:
     // and once it sees them change it'll rebuild the affected root signatures and pipeline states.
     // In order to prevent RS/PSOs to switch out from under your feet mid-frame,
     // the changes are only committed when you call UpdatePipelines().
-    // That means you should call UpdatePipelines() perhaps once per frame, at the start of the frame.
+    // You should call UpdatePipelines() once per frame, at the start of the frame.
+    // This is because each UpdatePipelines() also garbage collects old PSOs after maximumFrameLatency frames passed.
     virtual void UpdatePipelines() = 0;
 };
