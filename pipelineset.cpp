@@ -1416,6 +1416,9 @@ public:
             it->second -= 1;
             if (it->second <= 0)
             {
+                // assert for good measure. Should always be replacing the pointer with a new one (unless they're both NULL in which case it's a no-op)
+                assert((it->first->pPublicPtr == NULL && it->first->pInternalPtr == NULL) != (it->first->pPublicPtr != it->first->pInternalPtr));
+
                 if (it->first->pPublicPtr != NULL)
                 {
                     // We can now release the last public ptr since maximum latency frames have passed
@@ -1438,6 +1441,9 @@ public:
             it->second -= 1;
             if (it->second <= 0)
             {
+                // assert for good measure. Should always be replacing the pointer with a new one (unless they're both NULL in which case it's a no-op)
+                assert((it->first->pPublicPtr == NULL && it->first->pInternalPtr == NULL) != (it->first->pPublicPtr != it->first->pInternalPtr));
+
                 if (it->first->pPublicPtr != NULL)
                 {
                     // We can now release the last public ptr since maximum latency frames have passed
