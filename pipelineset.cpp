@@ -233,14 +233,18 @@ class PipelineSet : public IPipelineSet
     // Thread that asynchronously watches for any changes to shader files and reloads the RSs and PSOs
     std::thread mChangeNotifWatcherThread;
 
-    // When an object gets live-reloaded, a delay is added before it gets exposed through the public ptr.
+    // When an object gets live-reloaded, it gets put in place of the public ptr at the next update.
+    // However, the old public ptr can't be Release()'d right away, since it might still be in use.
+    // For this reason, the deletion of the old public pointer is delayed by a certain number of frames, to guarantee is won't be in use anymore.
     // This delay consists of #mMaximumFrameLatency calls to UpdatePipelines()
     // The number associated to the objects here contain the countdown number, which is decremented with every update.
     // Note these aren't used for the initial creation of resources, as an optimization for the most common scenario of no reloading (see mDidInitialCommit).
     // When the commit is complete, the associated pair gets removed from the map.
     // These maps should only be accessed when mReloadablePointerLock is held.
-    std::map<ReloadableRootSignature*, int> mRootSignatureCommitQueue;
-    std::map<ReloadablePipelineState*, int> mPipelineCommitQueue;
+    std::set<ReloadableRootSignature*> mRootSignaturesToCommit;
+    std::set<ReloadablePipelineState*> mPipelinesToCommit;
+    std::map<ID3D12RootSignature*, int> mRootSignatureGarbageCollectQueue;
+    std::map<ID3D12PipelineState*, int> mPipelineGarbageCollectQueue;
 
     // Event used to signal that the initial build of the pipelines has finished.
     HANDLE mhBuildAsyncEvent = NULL;
@@ -320,6 +324,18 @@ public:
             {
                 f2rs.second.pInternalPtr->Release();
             }
+        }
+
+        // Release everything in the RS GC queue
+        for (std::pair<ID3D12RootSignature* const, int>& rsgc : mRootSignatureGarbageCollectQueue)
+        {
+            rsgc.first->Release();
+        }
+
+        // Release everything in the PSO GC queue
+        for (std::pair<ID3D12PipelineState* const, int>& psogc : mPipelineGarbageCollectQueue)
+        {
+            psogc.first->Release();
         }
     }
 
@@ -1103,8 +1119,7 @@ public:
                         rsf2rs.second->pInternalPtr = pRootSignature;
 
                         // insert this RS in the commit queue if it's not there yet
-                        // The latency is +1 to account for the last frame where the public pointer might be used
-                        mRootSignatureCommitQueue.emplace(rsf2rs.second, mMaximumFrameLatency + 1);
+                        mRootSignaturesToCommit.emplace(rsf2rs.second);
                     }
                     else
                     {
@@ -1231,8 +1246,7 @@ public:
                         pPipeline->pInternalPtr = pPipelineState;
 
                         // insert this PSO in the commit queue if it's not there yet
-                        // The latency is +1 to account for the last frame where the public pointer might be used
-                        mPipelineCommitQueue.emplace(pPipeline, mMaximumFrameLatency + 1);
+                        mPipelinesToCommit.emplace(pPipeline);
                     }
                     else
                     {
@@ -1385,11 +1399,13 @@ public:
         //  for the case where we don't have to deal with all the complexity of delaying the initialization.
         if (!mDidInitialCommit)
         {
-            // The queues aren't necessary in this case, since there's nothing to invalidate.
-            // There might only be something in the queue if you somehow change a file in between BuildAllAsync() finishing and calling UpdatePipelines()
-            // It's unlikely, but handled here anyways to be sure.
-            mRootSignatureCommitQueue.clear();
-            mPipelineCommitQueue.clear();
+            // The queues aren't necessary in this case, since we're going to commit everything anyways.
+            mRootSignaturesToCommit.clear();
+            mPipelinesToCommit.clear();
+            
+            // There also can't be anything put up for garbage collection yet, since no references have escaped the IPipelineSet yet.
+            assert(mRootSignatureGarbageCollectQueue.empty());
+            assert(mPipelineGarbageCollectQueue.empty());
 
             // Just straight copy every internal pointer to public pointer
             // The public pointer might still be null if the internal pointer failed to be built
@@ -1407,56 +1423,79 @@ public:
             return;
         }
 
-        // Everything in the commit queues is decremented, and if they reach 0 that means we can now safely swap out their pointers.
-        for (std::map<ReloadableRootSignature*, int>::iterator it = begin(mRootSignatureCommitQueue); it != end(mRootSignatureCommitQueue); /* manual "it" update */)
+        // Every Root Siganture in the garbage collection queues is decremented, and if they reach 0 that means we can now safely delete them.
+        for (std::map<ID3D12RootSignature*, int>::iterator it = begin(mRootSignatureGarbageCollectQueue); it != end(mRootSignatureGarbageCollectQueue); /* manual "it" update */)
         {
             // get the next one now, because we'll possibly delete the current node.
-            std::map<ReloadableRootSignature*, int>::iterator it_next = next(it);
+            std::map<ID3D12RootSignature*, int>::iterator it_next = next(it);
 
             it->second -= 1;
             if (it->second <= 0)
             {
-                // assert for good measure. Should always be replacing the pointer with a new one (unless they're both NULL in which case it's a no-op)
-                assert((it->first->pPublicPtr == NULL && it->first->pInternalPtr == NULL) != (it->first->pPublicPtr != it->first->pInternalPtr));
+                // We can now release the root signature since maximum latency frames have passed
+                it->first->Release();
 
-                if (it->first->pPublicPtr != NULL)
-                {
-                    // We can now release the last public ptr since maximum latency frames have passed
-                    it->first->pPublicPtr->Release();
-                }
-
-                // Swap out the pointer and remove it from the commit queue
-                it->first->pPublicPtr = it->first->pInternalPtr;
-                mRootSignatureCommitQueue.erase(it);
+                // Remove it from the GC queue now that it's been deleted
+                mRootSignatureGarbageCollectQueue.erase(it);
             }
 
             it = it_next;
         }
 
-        for (std::map<ReloadablePipelineState*, int>::iterator it = begin(mPipelineCommitQueue); it != end(mPipelineCommitQueue); /* manual "it" update */)
+        // Every PSO in the garbage collection queues is decremented, and if they reach 0 that means we can now safely delete them.
+        for (std::map<ID3D12PipelineState*, int>::iterator it = begin(mPipelineGarbageCollectQueue); it != end(mPipelineGarbageCollectQueue); /* manual "it" update */)
         {
             // get the next one now, because we'll possibly delete the current node.
-            std::map<ReloadablePipelineState*, int>::iterator it_next = next(it);
+            std::map<ID3D12PipelineState*, int>::iterator it_next = next(it);
 
             it->second -= 1;
             if (it->second <= 0)
             {
-                // assert for good measure. Should always be replacing the pointer with a new one (unless they're both NULL in which case it's a no-op)
-                assert((it->first->pPublicPtr == NULL && it->first->pInternalPtr == NULL) != (it->first->pPublicPtr != it->first->pInternalPtr));
+                // We can now release the PSO since maximum latency frames have passed
+                it->first->Release();
 
-                if (it->first->pPublicPtr != NULL)
-                {
-                    // We can now release the last public ptr since maximum latency frames have passed
-                    it->first->pPublicPtr->Release();
-                }
-
-                // Swap out the pointer and remove it from the commit queue
-                it->first->pPublicPtr = it->first->pInternalPtr;
-                mPipelineCommitQueue.erase(it);
+                // Remove it from the GC queue now that it's been deleted
+                mPipelineGarbageCollectQueue.erase(it);
             }
 
             it = it_next;
         }
+
+        // Commit all root signatures that have changed since the last update
+        for (ReloadableRootSignature* pRS : mRootSignaturesToCommit)
+        {
+            // assert for good measure. Should always be replacing the pointer with a new one (unless they're both NULL in which case it's a no-op)
+            assert((pRS->pPublicPtr == NULL && pRS->pInternalPtr == NULL) != (pRS->pPublicPtr != pRS->pInternalPtr));
+
+            if (pRS->pPublicPtr != NULL)
+            {
+                // enqueue the public ptr to replace into the garbage collection queue.
+                mRootSignatureGarbageCollectQueue.emplace(pRS->pPublicPtr, mMaximumFrameLatency);
+            }
+
+            // Expose the new public ptr
+            pRS->pPublicPtr = pRS->pInternalPtr;
+        }
+
+        // Commit all pipelines that have changed since the last update
+        for (ReloadablePipelineState* pPipeline : mPipelinesToCommit)
+        {
+            // assert for good measure. Should always be replacing the pointer with a new one (unless they're both NULL in which case it's a no-op)
+            assert((pPipeline->pPublicPtr == NULL && pPipeline->pInternalPtr == NULL) != (pPipeline->pPublicPtr != pPipeline->pInternalPtr));
+
+            if (pPipeline->pPublicPtr != NULL)
+            {
+                // enqueue the public ptr to replace into the garbage collection queue.
+                mPipelineGarbageCollectQueue.emplace(pPipeline->pPublicPtr, mMaximumFrameLatency);
+            }
+
+            // Expose the new public ptr
+            pPipeline->pPublicPtr = pPipeline->pInternalPtr;
+        }
+
+        // can now ditch the commit queues, since they've all been processed.
+        mRootSignaturesToCommit.clear();
+        mPipelinesToCommit.clear();
     }
 };
 
