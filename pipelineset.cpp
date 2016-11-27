@@ -846,15 +846,15 @@ public:
             // All the files that were modified according to this directory change notification
             std::set<std::wstring> modifiedFiles;
 
-            DWORD lBytesReturned;
-            BOOL rdcResult = ReadDirectoryChangesW(mDirectoriesToWatch.at(dir), pDirectoryChangeBuffer.get(), (DWORD)kDirectoryChangeBufferSize, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE, &lBytesReturned, NULL, NULL);
+            DWORD dwBytesReturned;
+            BOOL rdcResult = ReadDirectoryChangesW(mDirectoriesToWatch.at(dir), pDirectoryChangeBuffer.get(), (DWORD)kDirectoryChangeBufferSize, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE, &dwBytesReturned, NULL, NULL);
             if (rdcResult != FALSE)
             {
                 // Read the results of the directory changes
-                DWORD lCurrOffset = 0;
-                while (lCurrOffset < lBytesReturned)
+                DWORD dwCurrOffset = 0;
+                while (dwCurrOffset < dwBytesReturned)
                 {
-                    FILE_NOTIFY_INFORMATION* pNotification = (FILE_NOTIFY_INFORMATION*)(pDirectoryChangeBuffer.get() + lCurrOffset);
+                    FILE_NOTIFY_INFORMATION* pNotification = (FILE_NOTIFY_INFORMATION*)(pDirectoryChangeBuffer.get() + dwCurrOffset);
 
                     if (pNotification->Action == FILE_ACTION_MODIFIED)
                     {
@@ -875,13 +875,13 @@ public:
                     if (pNotification->NextEntryOffset == 0)
                     {
                         // NextEntryOffset == 0 indicates the last entry
-                        lCurrOffset = lBytesReturned;
+                        dwCurrOffset = dwBytesReturned;
                         break;
                     }
                     else
                     {
                         // go to the next notification
-                        lCurrOffset += pNotification->NextEntryOffset;
+                        dwCurrOffset += pNotification->NextEntryOffset;
                     }
                 }
             }
@@ -1107,6 +1107,8 @@ public:
                         // If you got to this point, you didn't fail. Congrats!
 
                         // Release the old internal (and not published) pointer if it existed
+                        // Note this old internal ptr could be the same ptr as the new pRootSignature if they had identical input
+                        // but the second Create() will have incremented the refcount, so it should all be good.
                         if (rsf2rs.second->pInternalPtr != rsf2rs.second->pPublicPtr)
                         {
                             if (rsf2rs.second->pInternalPtr != NULL)
@@ -1118,8 +1120,14 @@ public:
                         // Hold on to the new value
                         rsf2rs.second->pInternalPtr = pRootSignature;
 
-                        // insert this RS in the commit queue if it's not there yet
-                        mRootSignaturesToCommit.emplace(rsf2rs.second);
+                        // It's possible for the public pointer to already be the same as what was just created,
+                        // since D3D12 automatically recycles Root Signatures built with the same description.
+                        // If we did indeed get the same pointer back, then there's no need to commit it, since it's already set.
+                        if (rsf2rs.second->pPublicPtr != pRootSignature)
+                        {
+                            // insert this RS in the commit queue if it's not there yet
+                            mRootSignaturesToCommit.emplace(rsf2rs.second);
+                        }
                     }
                     else
                     {
@@ -1234,6 +1242,8 @@ public:
                         // If you got here, you succeeded. Congrats!
 
                         // Release the old internal (and not published) pointer if it existed
+                        // Note this old internal ptr *might* (see comment below) be the same ptr as the new pPipelineState if they had identical input
+                        // but the second Create() will have incremented the refcount, so it should all be good.
                         if (pPipeline->pInternalPtr != pPipeline->pPublicPtr)
                         {
                             if (pPipeline->pInternalPtr != NULL)
@@ -1245,8 +1255,17 @@ public:
                         // Hold on to the new value
                         pPipeline->pInternalPtr = pPipelineState;
 
-                        // insert this PSO in the commit queue if it's not there yet
-                        mPipelinesToCommit.emplace(pPipeline);
+                        // It's possible for the public pointer to already be the same as what was just created,
+                        // since D3D12 automatically recycles Root Signatures built with the same description.
+                        // I haven't seen the RootSig recycling behavior happening on PSOs yet,
+                        // but might as well handle it in case the behaviour is implementation-specified.
+
+                        // If we did indeed get the same pointer back, then there's no need to commit it, since it's already set.
+                        if (pPipeline->pPublicPtr != pPipelineState)
+                        {
+                            // insert this PSO into the commit queue if it's not there yet
+                            mPipelinesToCommit.emplace(pPipeline);
+                        }
                     }
                     else
                     {
