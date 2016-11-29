@@ -213,6 +213,12 @@ class PipelineSet : public IPipelineSet
     // All the shader files that are being watched by the PipelineSet.
     std::map<std::wstring, ReloadableShader> mFileToShader;
 
+    // The last time each file was written.
+    // This is useful because the directory watcher redundantly reports writes many times sometimes,
+    // so this is used to filter the results.
+    // Timestamps are initially 0 until the file gets actually opened for the first time.
+    std::map<std::wstring, UINT64> mFileToLastWriteTimestamp;
+
     // When RS and PSOs are reloaded there has to be some fiddling between their public and internal pointers.
     // This lock grants exclusive access to ALL the public and internal ptrs in this class.
     std::mutex mReloadablePointerLock;
@@ -223,15 +229,57 @@ class PipelineSet : public IPipelineSet
     // This also lets me get the proper access rights so nobody can delete a watched directory out from under my feet.
     std::map<std::wstring, HANDLE> mDirectoriesToWatch;
 
-    // When a change notification handle gets signaled, we can know which directory it was using this map.
-    // The HANDLE here is the change notification handle.
-    std::map<HANDLE, std::wstring> mChangeNotificationToDirectory;
+    // Represents an IO task calling ReadDirectoryChanges in asynchronous mode.
+    // Used by the DirectoryWatcherThread.
+    struct RDCTask
+    {
+        // Just for sanity checking for APCs. Not functionally required.
+        DWORD DirectoryWatcherThreadId;
 
-    // Event to send to the change notification watcher thread to say that it should shut itself down
-    HANDLE hEndChangeNotificationsEvent = NULL;
+        // The directory for which this task is looking at changes.
+        std::wstring DirectoryPath;
+        HANDLE DirectoryHandle;
 
-    // Thread that asynchronously watches for any changes to shader files and reloads the RSs and PSOs
-    std::thread mChangeNotifWatcherThread;
+        // ReadDirectoryChanges docs say "The hEvent member of the OVERLAPPED structure is not used by the system, so you can use it yourself."
+        // So the hEvent of this OVERLAPPED is used as a "userdata" pointer to this RDCTask.
+        OVERLAPPED Overlapped;
+
+        // Total number of active RDC tasks
+        // When this is 0, that means there are no more RDC Tasks (ie. they've all been cancelled successfully).
+        // Tasks should decrement this number when they shut themselves down.
+        int* pOutstandingRDCTaskCount;
+
+        // Buffer used to store the directory changes.
+        // The choice of 64k is because that's the maximum allowed when you're monitoring a directory over a network (see ReadDirectoryChangesW documentation).
+        // If the result needs more memory than this, the ReadDirectoryChangesW will fail, and the code has to fallback to manually traversing the directory.
+        // It could be made bigger if need be, but be careful because this is non-paged kernel memory, so making this too big might be costly.
+        // For now I assume that missing some changes is not the end of the world, and 64k is enough for most realistic purposes.
+        static const size_t kDirectoryChangeBufferSize = 64 * 1024;
+        std::unique_ptr<char[]> pDirectoryChangeBuffer;
+
+        // Pointer back to the PipelineSet that spawned this task,
+        // so we can call HandleFileChangeNotifications
+        PipelineSet* pPipelineSet;
+    };
+
+    // Data for the directory watcher
+    // Put into a class so its context can be passed through an APC...
+    struct DirectoryWatcher
+    {
+        // Thread that asynchronously watches for any changes to shader files and reloads the RSs and PSOs.
+        std::thread DirectoryWatcherThread;
+
+        // The IO tasks currently asynchronously watching for directory changes.
+        std::vector<std::unique_ptr<RDCTask>> RDCTasks;
+
+        // Set to true when the terminate APC is received.
+        bool ShouldTerminate = false;
+
+        // Set to true after the watcher sent CancelIo()s to its IO tasks. It then waits for the cancels to finish before exiting the thread.
+        bool StartedCancelling = false;
+    };
+
+    DirectoryWatcher mDirectoryWatcher;
 
     // When an object gets live-reloaded, it gets put in place of the public ptr at the next update.
     // However, the old public ptr can't be Release()'d right away, since it might still be in use.
@@ -270,17 +318,12 @@ public:
         }
 
         // Stop looking for any change notifications (only if they've started already)
-        if (hEndChangeNotificationsEvent != NULL)
+        if (mDirectoryWatcher.DirectoryWatcherThread.joinable())
         {
-            CHECKWIN32(SetEvent(hEndChangeNotificationsEvent) != FALSE);
-            mChangeNotifWatcherThread.join();
-            CHECKWIN32(CloseHandle(hEndChangeNotificationsEvent) != FALSE);
-        }
-
-        // Close all file notification objects
-        for (std::pair<const HANDLE, std::wstring>& notif2dir : mChangeNotificationToDirectory)
-        {
-            CHECKWIN32(FindCloseChangeNotification(notif2dir.first) != FALSE);
+            // Send an APC that asks for the directory watcher to shut down
+            CHECKWIN32(QueueUserAPC(DirectoryWatcherTerminateAPC, static_cast<HANDLE>(mDirectoryWatcher.DirectoryWatcherThread.native_handle()), reinterpret_cast<ULONG_PTR>(&mDirectoryWatcher)) != 0);
+            // wait for the directory to receive and process the shutdown message
+            mDirectoryWatcher.DirectoryWatcherThread.join();
         }
 
         // Close all opened directories
@@ -382,6 +425,9 @@ public:
             std::tie(it, inserted) = mFileToRS.emplace(fullPathBuffer.get(), ReloadableRootSignature{});
             retval.first = &it->second.pPublicPtr;
 
+            // Initial timestamp
+            mFileToLastWriteTimestamp.emplace(fullPathBuffer.get(), 0);
+
             // add the directory to the set of directories to watch
             // note I'm subslicing the string to keep only the directory part
             mDirectoriesToWatch.emplace(std::wstring(fullPathBuffer.get(), lpFilePart), INVALID_HANDLE_VALUE);
@@ -456,10 +502,13 @@ public:
             DWORD fullPathResult = GetFullPathNameW(shaderFilename->c_str(), fullPathLengthPlusOne, fullPathBuffer.get(), &lpFilePart);
             CHECKWIN32(fullPathResult < fullPathLengthPlusOne); // the copy to the buffer should succeed
 
-                                                                // add the shader file to the list of shader files
+            // add the shader file to the list of shader files
             bool inserted;
             std::map<std::wstring, ReloadableShader>::iterator it;
             std::tie(it, inserted) = mFileToShader.emplace(fullPathBuffer.get(), ReloadableShader{});
+
+            // Initial timestamp
+            mFileToLastWriteTimestamp.emplace(fullPathBuffer.get(), 0);
 
             // add the directory to the set of directories to watch
             // note I'm subslicing the string to keep only the directory part
@@ -536,6 +585,17 @@ public:
                     goto fail;
                 }
 
+                // Set the actual initial timestamp
+                {
+                    FILETIME lastWriteTime;
+                    CHECKWIN32(GetFileTime(mapping.hFile, NULL, NULL, &lastWriteTime) != FALSE);
+                    LARGE_INTEGER largeWriteTime;
+                    largeWriteTime.HighPart = lastWriteTime.dwHighDateTime;
+                    largeWriteTime.LowPart = lastWriteTime.dwLowDateTime;
+
+                    mFileToLastWriteTimestamp.at(*filename) = largeWriteTime.QuadPart;
+                }
+
                 CHECKWIN32(GetFileSizeEx(mapping.hFile, &mapping.DataSize) != FALSE);
 
                 mapping.hFileMapping = CreateFileMappingW(mapping.hFile, NULL, PAGE_READONLY, 0, 0, NULL);
@@ -585,6 +645,16 @@ public:
                 // this file was failed to be mapped :(
                 // The ReloadableRootSignature will remain NULL to indicate that it failed.
                 continue;
+            }
+
+            // Store the timestamp for this modification
+            {
+                FILETIME writeTime;
+                CHECKWIN32(GetFileTime(mapping.hFile, NULL, NULL, &writeTime) != FALSE);
+
+                LARGE_INTEGER largeWriteTime;
+                largeWriteTime.HighPart = writeTime.dwHighDateTime;
+                largeWriteTime.LowPart = writeTime.dwLowDateTime;
             }
 
             // Attempt to create the root signature
@@ -768,582 +838,234 @@ public:
         for (std::pair<const std::wstring, HANDLE>& name2hdir : mDirectoriesToWatch)
         {
             // Open handle to the directory
-            name2hdir.second = CreateFileW(name2hdir.first.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+            name2hdir.second = CreateFileW(name2hdir.first.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
             CHECKWIN32(name2hdir.second != INVALID_HANDLE_VALUE);
-
-            HANDLE hChangeNotif = FindFirstChangeNotificationW(name2hdir.first.c_str(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
-            CHECKWIN32(hChangeNotif != INVALID_HANDLE_VALUE);
-
-            mChangeNotificationToDirectory.emplace(hChangeNotif, name2hdir.first);
         }
 
-        hEndChangeNotificationsEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-        CHECKWIN32(hEndChangeNotificationsEvent != NULL);
-
-        mChangeNotifWatcherThread = std::thread([this] { ChangeNotificationWatcherMain(); });
-        SetThreadName(mChangeNotifWatcherThread, "PSO File Watcher");
+        mDirectoryWatcher.DirectoryWatcherThread = std::thread([this] { DirectoryWatcherMain(); });
+        SetThreadName(mDirectoryWatcher.DirectoryWatcherThread, "PSO Directory Watcher");
     }
 
-    // This function represents the thread that responds to change notification events
-    void ChangeNotificationWatcherMain()
+    // This function gets called whenever a directory change notification happens.
+    // Since these directory change notifications happen through the directory watcher thread's APC queue,
+    // this function should only ever be called once at a time (ie. it's doesn't need to be reentrant.)
+    // However, this function still has to play nice with API calls to PipelineSet happening in parallel to it, so do proper locking when necessary.
+    void ProcessFileChangeNotifications(const WCHAR* pszDirectoryPath, char* pDirectoryChangeBuffer, DWORD dwDirectoryChangeBufferSizeInBytes)
     {
-        // Buffer to store the results of ReadDirectoryChangesW
-        // The choice of 64k is because that's the maximum allowed when you're monitoring a directory over a network (see ReadDirectoryChangesW documentation).
-        // If the result needs more memory than this, the ReadDirectoryChangesW will fail, and the code has to fallback to manually traversing the directory.
-        size_t kDirectoryChangeBufferSize = 64 * 1024;
-        std::unique_ptr<char[]> pDirectoryChangeBuffer = std::make_unique<char[]>(kDirectoryChangeBufferSize);
+        // fwprintf(stdout, L"Directory %s had a change\n", pszDirectoryPath);
 
-        // grab a list of all the events to wait for
-        std::vector<HANDLE> eventsToWaitFor;
-        for (const std::pair<const HANDLE, std::wstring>& notif2dir : mChangeNotificationToDirectory)
+        // All the files that were modified according to this directory change notification
+        std::set<std::wstring> modifiedFiles;
+
+        // Read the results of the directory changes
+        DWORD dwCurrOffset = 0;
+        while (dwCurrOffset < dwDirectoryChangeBufferSizeInBytes)
         {
-            eventsToWaitFor.push_back(notif2dir.first);
-        }
-        eventsToWaitFor.push_back(hEndChangeNotificationsEvent);
+            FILE_NOTIFY_INFORMATION* pNotification = (FILE_NOTIFY_INFORMATION*)(pDirectoryChangeBuffer + dwCurrOffset);
 
-        // The API for reading directory changes has this weird behavior where more than one event happens from one file change
-        // Background info: https://blogs.msdn.microsoft.com/oldnewthing/20140507-00/?p=1053/
-        //                  http://stackoverflow.com/questions/1764809/filesystemwatcher-changed-event-is-raised-twice
-        // Getting 2 events for one change is problematic:
-        // The second call to ReadDirectoryChangesW will block, since likely nothing changed in between the 2 events.
-        //
-        // It's a hack, but since this code is designed to work only with fxc, I'll just assume that the 2 event behaviour is not going to change.
-        // Just have a flag per event for this purpose.
-        std::vector<bool> eventHappenedOnce(eventsToWaitFor.size() - 1, false);
-
-        for (;;)
-        {
-            // wait for any of the directories to be changed, or for an event saying this thread should end.
-            DWORD waitResult = WaitForMultipleObjectsEx((DWORD)eventsToWaitFor.size(), eventsToWaitFor.data(), FALSE, INFINITE, FALSE);
-            CHECKWIN32(waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + eventsToWaitFor.size());
-
-            if (waitResult == WAIT_OBJECT_0 + eventsToWaitFor.size() - 1)
+            if (pNotification->Action == FILE_ACTION_MODIFIED)
             {
-                // The last event in the list is the event that says we close shop.
-                break;
-            }
+                // build a null terminated version of the filename (it isn't null terminated inside the FILE_NOTIFY_INFORMATION...)
+                // Also FileNameLength is _in bytes_, not symbols. *shakes fist*
+                std::wstring filename(pNotification->FileName, pNotification->FileName + pNotification->FileNameLength / sizeof(WCHAR));
 
-            if (eventHappenedOnce[waitResult - WAIT_OBJECT_0])
-            {
-                // this event was a repetition of an event that was already handled
-                // reset the flag so we can handle the next (non-repetition) event.
-                eventHappenedOnce[waitResult - WAIT_OBJECT_0] = false;
+                // The filename is relative to the directory it came from, so have to concatenate them to get the full path.
+                PWSTR pCombined;
+                CHECKHR(PathAllocCombine(pszDirectoryPath, filename.c_str(), PATHCCH_ALLOW_LONG_PATHS, &pCombined));
 
-                // Start looking for the next change
-                CHECKWIN32(FindNextChangeNotification(eventsToWaitFor[waitResult - WAIT_OBJECT_0]) != FALSE);
+                // dumb copy, but probably need it as a wstring anyways to emplace it
+                std::wstring combined = pCombined;
 
-                continue;
-            }
-
-            // set the flag now that we're actually handling it
-            // this'll make it so we don't handle this same change a second time.
-            eventHappenedOnce[waitResult - WAIT_OBJECT_0] = true;
-
-            // get the name of the directory that was changed
-            const std::wstring& dir = mChangeNotificationToDirectory.at(eventsToWaitFor[waitResult - WAIT_OBJECT_0]);
-            // fwprintf(stdout, L"Directory %s had a change\n", dir.c_str());
-
-            // All the files that were modified according to this directory change notification
-            std::set<std::wstring> modifiedFiles;
-
-            DWORD dwBytesReturned;
-            BOOL rdcResult = ReadDirectoryChangesW(mDirectoriesToWatch.at(dir), pDirectoryChangeBuffer.get(), (DWORD)kDirectoryChangeBufferSize, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE, &dwBytesReturned, NULL, NULL);
-            if (rdcResult != FALSE)
-            {
-                // Read the results of the directory changes
-                DWORD dwCurrOffset = 0;
-                while (dwCurrOffset < dwBytesReturned)
+                // log the modified file only if it's actually a shader file we care about
+                if (mFileToRS.find(combined) != end(mFileToRS) ||
+                    mFileToShader.find(combined) != end(mFileToShader))
                 {
-                    FILE_NOTIFY_INFORMATION* pNotification = (FILE_NOTIFY_INFORMATION*)(pDirectoryChangeBuffer.get() + dwCurrOffset);
-
-                    if (pNotification->Action == FILE_ACTION_MODIFIED)
-                    {
-                        // build a null terminated version of the filename (it isn't null terminated inside the FILE_NOTIFY_INFORMATION...)
-                        std::wstring filename(pNotification->FileName, pNotification->FileName + pNotification->FileNameLength);
-
-                        // The filename is relative to the directory it came from, so have to concatenate them to get the full path.
-                        PWSTR pCombined;
-                        CHECKHR(PathAllocCombine(dir.c_str(), filename.c_str(), PATHCCH_ALLOW_LONG_PATHS, &pCombined));
-
-                        // log the modified file
-                        modifiedFiles.insert(std::wstring(pCombined));
-
-                        // free memory allocated by PathAllocCombine
-                        LocalFree(pCombined);
-                    }
-
-                    if (pNotification->NextEntryOffset == 0)
-                    {
-                        // NextEntryOffset == 0 indicates the last entry
-                        dwCurrOffset = dwBytesReturned;
-                        break;
-                    }
-                    else
-                    {
-                        // go to the next notification
-                        dwCurrOffset += pNotification->NextEntryOffset;
-                    }
+                    modifiedFiles.insert(std::move(combined));
                 }
+
+                // free memory allocated by PathAllocCombine
+                LocalFree(pCombined);
+            }
+
+            if (pNotification->NextEntryOffset == 0)
+            {
+                // NextEntryOffset == 0 indicates the last entry
+                dwCurrOffset = dwDirectoryChangeBufferSizeInBytes;
+                break;
             }
             else
             {
-                // In this case, rdcResult == FALSE
-                // That might mean the operation failed for whatever reason,
-                // but if it says ERROR_NOTIFY_ENUM_DIR that means the directory change buffer wasn't big enough.
-                // If the directory change buffer isn't big enough, its contents are entirely dropped,
-                // and you have to manually check for changes yourself as fallback.
-                if (GetLastError() == ERROR_NOTIFY_ENUM_DIR)
+                // go to the next notification
+                dwCurrOffset += pNotification->NextEntryOffset;
+            }
+        }
+
+        // Now that we have all the modified files, we need to figure out what needs to be rebuilt.
+        std::set<std::pair<std::wstring, ReloadableRootSignature*>> rootSigsToRebuild;
+        std::set<ReloadablePipelineState*> pipelinesToRebuild;
+
+        // build a list of all the files that need to be memory mapped to rebuild the required resources
+        // This is not just the modified files. For example, modifying a VS means also re-loading the PS associated to it.
+        std::set<std::wstring> filesThatNeedMapping;
+
+        for (const std::wstring& modifiedFile : modifiedFiles)
+        {
+            // fwprintf(stdout, L"File %s was modified\n", modifiedFile.c_str());
+
+            filesThatNeedMapping.insert(modifiedFile);
+
+            // Add all pipelines that depend on this root signature (if it's used as a root signature)
+            auto foundRS = mFileToRS.find(modifiedFile);
+            if (foundRS != end(mFileToRS))
+            {
+                rootSigsToRebuild.emplace(modifiedFile, &foundRS->second);
+                for (ReloadablePipelineState* pDependentPipeline : foundRS->second.DependentPipelines)
                 {
-                    // For now I'm too lazy to actually do this.
-                    // If you somehow filled up that buffer (how?!), then just rebuild your shaders to get the notification.
-                    fwprintf(stderr, L"Warning: Failed to ReadDirectoryChangesW (ERROR_NOTIFY_ENUM_DIR)\n");
+                    pipelinesToRebuild.insert(pDependentPipeline);
                 }
             }
 
-            // Now that we have all the modified files, we need to figure out what needs to be rebuilt.
-            std::set<std::pair<std::wstring, ReloadableRootSignature*>> rootSigsToRebuild;
-            std::set<ReloadablePipelineState*> pipelinesToRebuild;
-
-            // build a list of all the files that need to be memory mapped to rebuild the required resources
-            // This is not just the modified files. For example, modifying a VS means also re-loading the PS associated to it.
-            std::set<std::wstring> filesThatNeedMapping;
-
-            for (const std::wstring& modifiedFile : modifiedFiles)
+            // Add all the pipelines that depend on this shader (if it's used as a shader)
+            auto foundShader = mFileToShader.find(modifiedFile);
+            if (foundShader != end(mFileToShader))
             {
-                // fwprintf(stdout, L"File %s was modified\n", modifiedFile.c_str());
-
-                filesThatNeedMapping.insert(modifiedFile);
-
-                // Add all pipelines that depend on this root signature (if it's used as a root signature)
-                auto foundRS = mFileToRS.find(modifiedFile);
-                if (foundRS != end(mFileToRS))
+                for (ReloadablePipelineState* pDependentPipeline : foundShader->second.DependentPipelines)
                 {
-                    rootSigsToRebuild.emplace(modifiedFile, &foundRS->second);
-                    for (ReloadablePipelineState* pDependentPipeline : foundRS->second.DependentPipelines)
-                    {
-                        pipelinesToRebuild.insert(pDependentPipeline);
-                    }
-                }
+                    pipelinesToRebuild.insert(pDependentPipeline);
 
-                // Add all the pipelines that depend on this shader (if it's used as a shader)
-                auto foundShader = mFileToShader.find(modifiedFile);
-                if (foundShader != end(mFileToShader))
-                {
-                    for (ReloadablePipelineState* pDependentPipeline : foundShader->second.DependentPipelines)
-                    {
-                        pipelinesToRebuild.insert(pDependentPipeline);
-
-                        // Also add the other files associated to this pipeline
-                        std::array<const std::wstring*, 6> filenames{ {
-                                &pDependentPipeline->Files.RSFile,
-                                &pDependentPipeline->Files.VSFile,
-                                &pDependentPipeline->Files.PSFile,
-                                &pDependentPipeline->Files.DSFile,
-                                &pDependentPipeline->Files.HSFile,
-                                &pDependentPipeline->Files.GSFile,
-                            } };
-
-                        for (const std::wstring* pFilename : filenames)
-                        {
-                            if (!pFilename->empty())
-                            {
-                                filesThatNeedMapping.insert(*pFilename);
-                            }
-                        }
-                    }
-                }
-            }
-
-            struct MappedFile
-            {
-                HANDLE hFile;
-                HANDLE hFileMapping;
-                PVOID pData;
-                LARGE_INTEGER DataSize;
-            };
-
-            // file mappings for all files referred to by the changes
-            std::unordered_map<std::wstring, MappedFile> filename2mapping;
-
-            // map all the files that have been modified
-            for (const std::wstring& modifiedFile : filesThatNeedMapping)
-            {
-                auto found = filename2mapping.emplace(modifiedFile, MappedFile{ INVALID_HANDLE_VALUE, NULL, NULL, 0 });
-                assert(found.second);
-
-                MappedFile mapping = { INVALID_HANDLE_VALUE, NULL, NULL, 0 };
-
-                // wish I could use gotos here but sigh C++
-                bool failed = false;
-
-                // Creating a file mapping involves three steps:
-                // 1) Opening the file
-                // 2) Creating a FileMapping object
-                // 3) Mapping the file to a pointer
-                // any of these steps can fail, most commonly due to not finding the file or due to a file read ownership issue (like the file is currently being written).
-                // If any of the steps fails, then all the other previous steps are undone.
-                if (!failed)
-                {
-                    // If we try to open the file immediately after getting the file change event,
-                    // it'll likely fail to open it because it's still currently being written to.
-                    // To handle this, just try with some sleeping in between.
-                    const int kMaxCreateFileAttempts = 100;
-                    const int kSleepMillisecondsBetweenAttempts = 10;
-
-                    for (int attempt = 0; attempt < kMaxCreateFileAttempts; attempt++)
-                    {
-                        mapping.hFile = CreateFileW(modifiedFile.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                        if (mapping.hFile != INVALID_HANDLE_VALUE)
-                        {
-                            // We did it boys!
-                            break;
-                        }
-
-                        Sleep(kSleepMillisecondsBetweenAttempts);
-                    }
-
-                    // Still couldn't open it? Alright, give up.
-                    if (mapping.hFile == INVALID_HANDLE_VALUE)
-                    {
-                        failed = true;
-                    }
-                }
-
-                if (!failed)
-                {
-                    CHECKWIN32(GetFileSizeEx(mapping.hFile, &mapping.DataSize) != FALSE);
-                }
-
-                if (!failed)
-                {
-                    mapping.hFileMapping = CreateFileMappingW(mapping.hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-                    if (mapping.hFileMapping == NULL)
-                    {
-                        failed = true;
-                    }
-                }
-
-                if (!failed)
-                {
-                    mapping.pData = MapViewOfFile(mapping.hFileMapping, FILE_MAP_READ, 0, 0, 0);
-                    if (!mapping.pData)
-                    {
-                        failed = true;
-                    }
-                }
-
-                if (!failed)
-                {
-                    // If we got here, that means we successfully mapped the file without error.
-                    // In this case, the result of the mapping is stored in filename2mapping, and we move on to the next file.
-                    found.first->second = mapping;
-                    continue;
-                }
-                else
-                {
-                    // report an error (assuming it was a Win32 error) and undo all the work.
-                    _com_error err(HRESULT_FROM_WIN32(GetLastError()));
-                    fwprintf(stderr, L"Error mapping file %s: %s\n", modifiedFile.c_str(), err.ErrorMessage());
-
-                    if (mapping.pData != NULL)
-                    {
-                        CHECKWIN32(UnmapViewOfFile(mapping.pData) != FALSE);
-                    }
-                    if (mapping.hFileMapping != NULL)
-                    {
-                        CHECKWIN32(CloseHandle(mapping.hFileMapping) != FALSE);
-                    }
-                    if (mapping.hFile != INVALID_HANDLE_VALUE)
-                    {
-                        CHECKWIN32(CloseHandle(mapping.hFile) != FALSE);
-                    }
-                }
-            }
-
-            // Lock a mutex to get access to the public and internal ptrs without another thread trying to read them.
-            {
-                std::lock_guard<std::mutex> ptrLock(mReloadablePointerLock);
-
-                // Rebuild all the root signatures
-                for (const std::pair<std::wstring, ReloadableRootSignature*>& rsf2rs : rootSigsToRebuild)
-                {
-                    // wish I could use gotos here but sigh C++
-                    bool failed = false;
-
-                    // Grab the file mapping of the root signature
-                    MappedFile mapping;
-                    if (!failed)
-                    {
-                        mapping = filename2mapping.at(rsf2rs.first);
-                        if (mapping.pData == NULL)
-                        {
-                            // this file was failed to be mapped :(
-                            // The ReloadableRootSignature will be set to NULL to indicate that it failed.
-                            failed = true;
-                        }
-                    }
-
-                    // Attempt to create the root signature
-                    ID3D12RootSignature* pRootSignature = NULL;
-                    if (!failed)
-                    {
-                        HRESULT hr = mpDevice->CreateRootSignature(0, mapping.pData, mapping.DataSize.QuadPart, IID_PPV_ARGS(&pRootSignature));
-                        if (FAILED(hr))
-                        {
-                            // It failed, so report an error message and leave the ReloadableRootSignature as NULL.
-                            _com_error err(hr);
-                            fwprintf(stderr, L"Error building RootSignature %s: %s\n", rsf2rs.first.c_str(), err.ErrorMessage());
-
-                            failed = true;
-                        }
-                        else
-                        {
-                            fwprintf(stderr, L"Successfully rebuilt RootSignature %s\n", rsf2rs.first.c_str());
-                        }
-                    }
-
-                    if (!failed)
-                    {
-                        // If you got to this point, you didn't fail. Congrats!
-
-                        // Release the old internal (and not published) pointer if it existed
-                        // Note this old internal ptr could be the same ptr as the new pRootSignature if they had identical input
-                        // but the second Create() will have incremented the refcount, so it should all be good.
-                        if (rsf2rs.second->pInternalPtr != rsf2rs.second->pPublicPtr)
-                        {
-                            if (rsf2rs.second->pInternalPtr != NULL)
-                            {
-                                rsf2rs.second->pInternalPtr->Release();
-                            }
-                        }
-
-                        // Hold on to the new value
-                        rsf2rs.second->pInternalPtr = pRootSignature;
-
-                        // It's possible for the public pointer to already be the same as what was just created,
-                        // since D3D12 automatically recycles Root Signatures built with the same description.
-                        // If we did indeed get the same pointer back, then there's no need to commit it, since it's already set.
-                        if (rsf2rs.second->pPublicPtr != pRootSignature)
-                        {
-                            // insert this RS in the commit queue if it's not there yet
-                            mRootSignaturesToCommit.emplace(rsf2rs.second);
-                        }
-                    }
-                    else
-                    {
-                        // Release the old internal (and not published) pointer if it existed
-                        if (rsf2rs.second->pInternalPtr != rsf2rs.second->pPublicPtr)
-                        {
-                            if (rsf2rs.second->pInternalPtr != NULL)
-                            {
-                                rsf2rs.second->pInternalPtr->Release();
-                            }
-                        }
-                        // Replace the new internal pointer with a NULL to indicate failure
-                        rsf2rs.second->pInternalPtr = NULL;
-                    }
-                }
-
-                // Rebuild all the PSOs
-                for (ReloadablePipelineState* pPipeline : pipelinesToRebuild)
-                {
-                    const GraphicsPipelineFiles& files = pPipeline->Files;
-
-                    // build the description of this PSO from the desc, in order to create it.
-                    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = pPipeline->PipelineStateDesc;
-
-                    // wish I could use gotos here but sigh C++
-                    bool failed = false;
-
-                    if (!failed)
-                    {
-                        if (desc.pRootSignature == NULL)
-                        {
-                            // If there was no user-supplied root signature, then it should come from the file.
-
-                            // If the RS came from a file, then either it was reloaded earlier in this function or it didn't change at all.
-                            // It's also possible that the RS is NULL if the last attempt to create it failed.
-
-                            desc.pRootSignature = mFileToRS.at(files.RSFile).pInternalPtr;
-
-                            if (desc.pRootSignature == NULL)
-                            {
-                                // No root signature :/
-                                // None user-supplied, and/or the one from the file failed to be created.
-                                failed = true;
-                            }
-                        }
-                    }
-
-                    if (!failed)
-                    {
-                        // Have to assign the bytecodes in the PSO Desc based on the files specified in the pipeline
-                        // They're all put together in one array here to make it easier to handle them all in the same way.
-                        std::array<std::pair<const std::wstring*, D3D12_SHADER_BYTECODE*>, 5> bytecodes{ {
-                            { &files.VSFile, &desc.VS },
-                            { &files.PSFile, &desc.PS },
-                            { &files.DSFile, &desc.DS },
-                            { &files.HSFile, &desc.HS },
-                            { &files.GSFile, &desc.GS },
-                            } };
-
-                        // If any of the bytecodes failed to be found during the mapping phase, then we can't build the PSO.
-                        // This flag checks for this condition.
-                        bool bytecodeMissing = false;
-
-                        // Assign all the shader bytecodes in the PSO desc (or notice one is missing)
-                        for (std::pair<const std::wstring*, D3D12_SHADER_BYTECODE*> bytecode : bytecodes)
-                        {
-                            if (bytecode.first->empty())
-                            {
-                                // no filename was assigned to this bytecode.
-                                // That means this is a user-supplied bytecode,
-                                // which means the user already put the right bytecode in the .VS of the pipeline.
-                                // We don't need to look for a file mapping, so we can happily skip this one.
-                                continue;
-                            }
-
-                            // grab the mapping for this file
-                            MappedFile mapping = filename2mapping.at(*bytecode.first);
-
-                            if (mapping.pData == NULL)
-                            {
-                                // Looks like the mapping of a shader failed, so we have to abandon building the PSO.
-                                bytecodeMissing = true;
-                                continue;
-                            }
-
-                            // The file mapping was found, so we can grab it and set it in the desc.
-                            bytecode.second->pShaderBytecode = mapping.pData;
-                            bytecode.second->BytecodeLength = mapping.DataSize.QuadPart;
-                        }
-
-                        if (bytecodeMissing)
-                        {
-                            // If one of the shader bytecodes was missing, we can't compile this PSO.
-                            failed = true;
-                        }
-                    }
-
-                    // At this point we've secured all the pieces of the PSO needed to build it, so let's build it already!
-                    ID3D12PipelineState* pPipelineState = NULL;
-                    HRESULT pso_hr;
-                    if (!failed)
-                    {
-                        pso_hr = mpDevice->CreateGraphicsPipelineState(&desc, __uuidof(ID3D12PipelineState), (void**)&pPipelineState);
-                        if (FAILED(pso_hr))
-                        {
-                            failed = true;
-                        }
-                    }
-
-                    if (!failed)
-                    {
-                        // If you got here, you succeeded. Congrats!
-
-                        // Release the old internal (and not published) pointer if it existed
-                        // Note this old internal ptr *might* (see comment below) be the same ptr as the new pPipelineState if they had identical input
-                        // but the second Create() will have incremented the refcount, so it should all be good.
-                        if (pPipeline->pInternalPtr != pPipeline->pPublicPtr)
-                        {
-                            if (pPipeline->pInternalPtr != NULL)
-                            {
-                                pPipeline->pInternalPtr->Release();
-                            }
-                        }
-
-                        // Hold on to the new value
-                        pPipeline->pInternalPtr = pPipelineState;
-
-                        // It's possible for the public pointer to already be the same as what was just created,
-                        // since D3D12 automatically recycles Root Signatures built with the same description.
-                        // I haven't seen the RootSig recycling behavior happening on PSOs yet,
-                        // but might as well handle it in case the behaviour is implementation-specified.
-
-                        // If we did indeed get the same pointer back, then there's no need to commit it, since it's already set.
-                        if (pPipeline->pPublicPtr != pPipelineState)
-                        {
-                            // insert this PSO into the commit queue if it's not there yet
-                            mPipelinesToCommit.emplace(pPipeline);
-                        }
-                    }
-                    else
-                    {
-                        // Oops, it failed. Print an error and leave the PSO null.
-
-                        // Release the old internal (and not published) pointer if it existed
-                        if (pPipeline->pInternalPtr != pPipeline->pPublicPtr)
-                        {
-                            if (pPipeline->pInternalPtr != NULL)
-                            {
-                                pPipeline->pInternalPtr->Release();
-                            }
-                        }
-
-                        // Replace the new internal pointer with a NULL to indicate failure
-                        pPipeline->pInternalPtr = NULL;
-                    }
-
-                    // Attempt to make a more descriptive error by sticking together all the files involved.
+                    // Also add the other files associated to this pipeline
                     std::array<const std::wstring*, 6> filenames{ {
-                            &files.RSFile,
-                            &files.VSFile,
-                            &files.PSFile,
-                            &files.DSFile,
-                            &files.HSFile,
-                            &files.GSFile,
+                            &pDependentPipeline->Files.RSFile,
+                            &pDependentPipeline->Files.VSFile,
+                            &pDependentPipeline->Files.PSFile,
+                            &pDependentPipeline->Files.DSFile,
+                            &pDependentPipeline->Files.HSFile,
+                            &pDependentPipeline->Files.GSFile,
                         } };
 
-                    const wchar_t* filePrefixes[] = {
-                        L"RS",
-                        L"VS",
-                        L"PS",
-                        L"DS",
-                        L"HS",
-                        L"GS",
-                    };
-
-                    std::wstring filenamesDisplay = L" (";
-                    bool firstName = true;
-                    for (int fileIdx = 0; fileIdx < (int)filenames.size(); fileIdx++)
+                    for (const std::wstring* pFilename : filenames)
                     {
-                        const std::wstring* name = filenames[fileIdx];
-
-                        if (name->empty())
+                        if (!pFilename->empty())
                         {
-                            continue;
+                            filesThatNeedMapping.insert(*pFilename);
                         }
-
-                        if (!firstName)
-                        {
-                            filenamesDisplay += L", ";
-                        }
-
-                        filenamesDisplay += filePrefixes[fileIdx];
-                        filenamesDisplay += L":";
-                        filenamesDisplay += *name;
-
-                        firstName = false;
-                    }
-
-                    filenamesDisplay += L")";
-
-                    if (failed)
-                    {
-                        _com_error err(pso_hr);
-                        fwprintf(stderr, L"Error building GraphicsPipelineState%s: %s\n", filenamesDisplay.c_str(), err.ErrorMessage());
-                    }
-                    else
-                    {
-                        fwprintf(stdout, L"Successfully rebuilt GraphicsPipelineState%s\n", filenamesDisplay.c_str());
                     }
                 }
             }
+        }
 
-            // Unmap all the files that were mapped at the start of reloading
-            for (auto& f2m : filename2mapping)
+        struct MappedFile
+        {
+            HANDLE hFile;
+            HANDLE hFileMapping;
+            PVOID pData;
+            LARGE_INTEGER DataSize;
+
+            // true if the file's last write timestamp is different from last time
+            // used to avoid building RS/PSOs twice if redundant directory change notifications come in
+            bool ActuallyChanged;
+        };
+
+        // file mappings for all files referred to by the changes
+        std::unordered_map<std::wstring, MappedFile> filename2mapping;
+
+        // map all the files that have been modified
+        for (const std::wstring& modifiedFile : filesThatNeedMapping)
+        {
+            auto found = filename2mapping.emplace(modifiedFile, MappedFile{ INVALID_HANDLE_VALUE, NULL, NULL, 0, false });
+            assert(found.second);
+
+            MappedFile mapping = { INVALID_HANDLE_VALUE, NULL, NULL, 0 };
+
+            // wish I could use gotos here but sigh C++
+            bool failed = false;
+
+            // Creating a file mapping involves three steps:
+            // 1) Opening the file
+            // 2) Creating a FileMapping object
+            // 3) Mapping the file to a pointer
+            // any of these steps can fail, most commonly due to not finding the file or due to a file read ownership issue (like the file is currently being written).
+            // If any of the steps fails, then all the other previous steps are undone.
+            if (!failed)
             {
-                MappedFile mapping = f2m.second;
+                // If we try to open the file immediately after getting the file change event,
+                // it'll likely fail to open it because it's still currently being written to.
+                // To handle this, just try with some sleeping in between.
+                const int kMaxCreateFileAttempts = 100;
+                const int kSleepMillisecondsBetweenAttempts = 10;
+
+                for (int attempt = 0; attempt < kMaxCreateFileAttempts; attempt++)
+                {
+                    mapping.hFile = CreateFileW(modifiedFile.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (mapping.hFile != INVALID_HANDLE_VALUE)
+                    {
+                        // We did it boys!
+                        break;
+                    }
+
+                    Sleep(kSleepMillisecondsBetweenAttempts);
+                }
+
+                // Still couldn't open it? Alright, give up.
+                if (mapping.hFile == INVALID_HANDLE_VALUE)
+                {
+                    failed = true;
+                }
+            }
+
+            if (!failed)
+            {
+                CHECKWIN32(GetFileSizeEx(mapping.hFile, &mapping.DataSize) != FALSE);
+            }
+
+            if (!failed)
+            {
+                // Check if the file actually changed and update its timestamp if so
+                FILETIME lastWriteTime;
+                CHECKWIN32(GetFileTime(mapping.hFile, NULL, NULL, &lastWriteTime) != FALSE);
+                LARGE_INTEGER largeWriteTime;
+                largeWriteTime.HighPart = lastWriteTime.dwHighDateTime;
+                largeWriteTime.LowPart = lastWriteTime.dwLowDateTime;
+
+                auto pCurrTimestamp = &mFileToLastWriteTimestamp.at(modifiedFile);
+                if ((UINT64)largeWriteTime.QuadPart > *pCurrTimestamp)
+                {
+                    mapping.ActuallyChanged = true;
+                    *pCurrTimestamp = largeWriteTime.QuadPart;
+                }
+            }
+
+            if (!failed)
+            {
+                mapping.hFileMapping = CreateFileMappingW(mapping.hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+                if (mapping.hFileMapping == NULL)
+                {
+                    failed = true;
+                }
+            }
+
+            if (!failed)
+            {
+                mapping.pData = MapViewOfFile(mapping.hFileMapping, FILE_MAP_READ, 0, 0, 0);
+                if (!mapping.pData)
+                {
+                    failed = true;
+                }
+            }
+
+            if (!failed)
+            {
+                // If we got here, that means we successfully mapped the file without error.
+                // In this case, the result of the mapping is stored in filename2mapping, and we move on to the next file.
+                found.first->second = mapping;
+                continue;
+            }
+            else
+            {
+                // report an error (assuming it was a Win32 error) and undo all the work.
+                _com_error err(HRESULT_FROM_WIN32(GetLastError()));
+                fwprintf(stderr, L"Error mapping file %s: %s\n", modifiedFile.c_str(), err.ErrorMessage());
+
                 if (mapping.pData != NULL)
                 {
                     CHECKWIN32(UnmapViewOfFile(mapping.pData) != FALSE);
@@ -1357,12 +1079,442 @@ public:
                     CHECKWIN32(CloseHandle(mapping.hFile) != FALSE);
                 }
             }
-
-            // printf("Finished handling directory change\n");
-
-            // Start looking for the next change
-            CHECKWIN32(FindNextChangeNotification(eventsToWaitFor[waitResult - WAIT_OBJECT_0]) != FALSE);
         }
+
+        // Lock a mutex to get access to the public and internal ptrs without another thread trying to read them.
+        {
+            std::lock_guard<std::mutex> ptrLock(mReloadablePointerLock);
+
+            // Rebuild all the root signatures
+            for (const std::pair<std::wstring, ReloadableRootSignature*>& rsf2rs : rootSigsToRebuild)
+            {
+                // wish I could use gotos here but sigh C++
+                bool failed = false;
+
+                // Grab the file mapping of the root signature
+                MappedFile mapping;
+                if (!failed)
+                {
+                    mapping = filename2mapping.at(rsf2rs.first);
+                    if (mapping.pData == NULL)
+                    {
+                        // this file was failed to be mapped :(
+                        // The ReloadableRootSignature will be set to NULL to indicate that it failed.
+                        failed = true;
+                    }
+                    else if (!mapping.ActuallyChanged)
+                    {
+                        // The root sig file didn't actually change, so we don't need to redundantly rebuild this.
+                        // Just bail out.
+                        continue;
+                    }
+                }
+
+                // Attempt to create the root signature
+                ID3D12RootSignature* pRootSignature = NULL;
+                if (!failed)
+                {
+                    HRESULT hr = mpDevice->CreateRootSignature(0, mapping.pData, mapping.DataSize.QuadPart, IID_PPV_ARGS(&pRootSignature));
+                    if (FAILED(hr))
+                    {
+                        // It failed, so report an error message and leave the ReloadableRootSignature as NULL.
+                        _com_error err(hr);
+                        fwprintf(stderr, L"Error building RootSignature %s: %s\n", rsf2rs.first.c_str(), err.ErrorMessage());
+
+                        failed = true;
+                    }
+                    else
+                    {
+                        fwprintf(stderr, L"Successfully rebuilt RootSignature %s\n", rsf2rs.first.c_str());
+                    }
+                }
+
+                if (!failed)
+                {
+                    // If you got to this point, you didn't fail. Congrats!
+
+                    // Release the old internal (and not published) pointer if it existed
+                    // Note this old internal ptr could be the same ptr as the new pRootSignature if they had identical input
+                    // but the second Create() will have incremented the refcount, so it should all be good.
+                    if (rsf2rs.second->pInternalPtr != rsf2rs.second->pPublicPtr)
+                    {
+                        if (rsf2rs.second->pInternalPtr != NULL)
+                        {
+                            rsf2rs.second->pInternalPtr->Release();
+                        }
+                    }
+
+                    // Hold on to the new value
+                    rsf2rs.second->pInternalPtr = pRootSignature;
+
+                    // It's possible for the public pointer to already be the same as what was just created,
+                    // since D3D12 automatically recycles Root Signatures built with the same description.
+                    // If we did indeed get the same pointer back, then there's no need to commit it, since it's already set.
+                    if (rsf2rs.second->pPublicPtr != pRootSignature)
+                    {
+                        // insert this RS in the commit queue if it's not there yet
+                        mRootSignaturesToCommit.emplace(rsf2rs.second);
+                    }
+                }
+                else
+                {
+                    // Release the old internal (and not published) pointer if it existed
+                    if (rsf2rs.second->pInternalPtr != rsf2rs.second->pPublicPtr)
+                    {
+                        if (rsf2rs.second->pInternalPtr != NULL)
+                        {
+                            rsf2rs.second->pInternalPtr->Release();
+                        }
+                    }
+                    // Replace the new internal pointer with a NULL to indicate failure
+                    rsf2rs.second->pInternalPtr = NULL;
+                }
+            }
+
+            // Rebuild all the PSOs
+            for (ReloadablePipelineState* pPipeline : pipelinesToRebuild)
+            {
+                const GraphicsPipelineFiles& files = pPipeline->Files;
+
+                // build the description of this PSO from the desc, in order to create it.
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = pPipeline->PipelineStateDesc;
+
+                // wish I could use gotos here but sigh C++
+                bool failed = false;
+
+                // It's possible the root signature was redundantly reported to change twice by the directory watcher
+                bool didRSActuallyChange = false;
+
+                if (!failed)
+                {
+                    if (desc.pRootSignature == NULL)
+                    {
+                        // If there was no user-supplied root signature, then it should come from the file.
+
+                        // If the RS came from a file, then either it was reloaded earlier in this function or it didn't change at all.
+                        // It's also possible that the RS is NULL if the last attempt to create it failed.
+
+                        desc.pRootSignature = mFileToRS.at(files.RSFile).pInternalPtr;
+
+                        if (desc.pRootSignature == NULL)
+                        {
+                            // No root signature :/
+                            // None user-supplied, and/or the one from the file failed to be created.
+                            failed = true;
+                        }
+                        else
+                        {
+                            auto foundMapping = filename2mapping.find(files.RSFile);
+                            if (foundMapping != end(filename2mapping))
+                            {
+                                if (foundMapping->second.ActuallyChanged)
+                                {
+                                    didRSActuallyChange = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!failed)
+                {
+                    // Have to assign the bytecodes in the PSO Desc based on the files specified in the pipeline
+                    // They're all put together in one array here to make it easier to handle them all in the same way.
+                    std::array<std::pair<const std::wstring*, D3D12_SHADER_BYTECODE*>, 5> bytecodes{ {
+                        { &files.VSFile, &desc.VS },
+                        { &files.PSFile, &desc.PS },
+                        { &files.DSFile, &desc.DS },
+                        { &files.HSFile, &desc.HS },
+                        { &files.GSFile, &desc.GS },
+                        } };
+
+                    // If any of the bytecodes failed to be found during the mapping phase, then we can't build the PSO.
+                    // This flag checks for this condition.
+                    bool bytecodeMissing = false;
+
+                    // It's possible that some bytecode was redundantly reported to change twice by the directory watcher
+                    bool didBytecodeActuallyChange = false;
+
+                    // Assign all the shader bytecodes in the PSO desc (or notice one is missing)
+                    for (std::pair<const std::wstring*, D3D12_SHADER_BYTECODE*> bytecode : bytecodes)
+                    {
+                        if (bytecode.first->empty())
+                        {
+                            // no filename was assigned to this bytecode.
+                            // That means this is a user-supplied bytecode,
+                            // which means the user already put the right bytecode in the .VS of the pipeline.
+                            // We don't need to look for a file mapping, so we can happily skip this one.
+                            continue;
+                        }
+
+                        // grab the mapping for this file
+                        MappedFile mapping = filename2mapping.at(*bytecode.first);
+
+                        if (mapping.pData == NULL)
+                        {
+                            // Looks like the mapping of a shader failed, so we have to abandon building the PSO.
+                            bytecodeMissing = true;
+                            continue;
+                        }
+
+                        if (mapping.ActuallyChanged)
+                        {
+                            didBytecodeActuallyChange = true;
+                        }
+
+                        // The file mapping was found, so we can grab it and set it in the desc.
+                        bytecode.second->pShaderBytecode = mapping.pData;
+                        bytecode.second->BytecodeLength = mapping.DataSize.QuadPart;
+                    }
+
+                    if (bytecodeMissing)
+                    {
+                        // If one of the shader bytecodes was missing, we can't compile this PSO.
+                        failed = true;
+                    }
+
+                    if (!didRSActuallyChange && !didBytecodeActuallyChange)
+                    {
+                        // No dependency of this PSO actually changed, it was just a redundant directory notification.
+                        // Just bail out.
+                        continue;
+                    }
+                }
+
+                // At this point we've secured all the pieces of the PSO needed to build it, so let's build it already!
+                ID3D12PipelineState* pPipelineState = NULL;
+                HRESULT pso_hr;
+                if (!failed)
+                {
+                    pso_hr = mpDevice->CreateGraphicsPipelineState(&desc, __uuidof(ID3D12PipelineState), (void**)&pPipelineState);
+                    if (FAILED(pso_hr))
+                    {
+                        failed = true;
+                    }
+                }
+
+                if (!failed)
+                {
+                    // If you got here, you succeeded. Congrats!
+
+                    // Release the old internal (and not published) pointer if it existed
+                    // Note this old internal ptr *might* (see comment below) be the same ptr as the new pPipelineState if they had identical input
+                    // but the second Create() will have incremented the refcount, so it should all be good.
+                    if (pPipeline->pInternalPtr != pPipeline->pPublicPtr)
+                    {
+                        if (pPipeline->pInternalPtr != NULL)
+                        {
+                            pPipeline->pInternalPtr->Release();
+                        }
+                    }
+
+                    // Hold on to the new value
+                    pPipeline->pInternalPtr = pPipelineState;
+
+                    // It's possible for the public pointer to already be the same as what was just created,
+                    // since D3D12 automatically recycles Root Signatures built with the same description.
+                    // I haven't seen the RootSig recycling behavior happening on PSOs yet,
+                    // but might as well handle it in case the behaviour is implementation-specified.
+
+                    // If we did indeed get the same pointer back, then there's no need to commit it, since it's already set.
+                    if (pPipeline->pPublicPtr != pPipelineState)
+                    {
+                        // insert this PSO into the commit queue if it's not there yet
+                        mPipelinesToCommit.emplace(pPipeline);
+                    }
+                }
+                else
+                {
+                    // Oops, it failed. Print an error and leave the PSO null.
+
+                    // Release the old internal (and not published) pointer if it existed
+                    if (pPipeline->pInternalPtr != pPipeline->pPublicPtr)
+                    {
+                        if (pPipeline->pInternalPtr != NULL)
+                        {
+                            pPipeline->pInternalPtr->Release();
+                        }
+                    }
+
+                    // Replace the new internal pointer with a NULL to indicate failure
+                    pPipeline->pInternalPtr = NULL;
+                }
+
+                // Attempt to make a more descriptive error by sticking together all the files involved.
+                std::array<const std::wstring*, 6> filenames{ {
+                        &files.RSFile,
+                        &files.VSFile,
+                        &files.PSFile,
+                        &files.DSFile,
+                        &files.HSFile,
+                        &files.GSFile,
+                    } };
+
+                const wchar_t* filePrefixes[] = {
+                    L"RS",
+                    L"VS",
+                    L"PS",
+                    L"DS",
+                    L"HS",
+                    L"GS",
+                };
+
+                std::wstring filenamesDisplay = L" (";
+                bool firstName = true;
+                for (int fileIdx = 0; fileIdx < (int)filenames.size(); fileIdx++)
+                {
+                    const std::wstring* name = filenames[fileIdx];
+
+                    if (name->empty())
+                    {
+                        continue;
+                    }
+
+                    if (!firstName)
+                    {
+                        filenamesDisplay += L", ";
+                    }
+
+                    filenamesDisplay += filePrefixes[fileIdx];
+                    filenamesDisplay += L":";
+                    filenamesDisplay += *name;
+
+                    firstName = false;
+                }
+
+                filenamesDisplay += L")";
+
+                if (failed)
+                {
+                    _com_error err(pso_hr);
+                    fwprintf(stderr, L"Error building GraphicsPipelineState%s: %s\n", filenamesDisplay.c_str(), err.ErrorMessage());
+                }
+                else
+                {
+                    fwprintf(stdout, L"Successfully rebuilt GraphicsPipelineState%s\n", filenamesDisplay.c_str());
+                }
+            }
+        }
+
+        // Unmap all the files that were mapped at the start of reloading
+        for (auto& f2m : filename2mapping)
+        {
+            MappedFile mapping = f2m.second;
+            if (mapping.pData != NULL)
+            {
+                CHECKWIN32(UnmapViewOfFile(mapping.pData) != FALSE);
+            }
+            if (mapping.hFileMapping != NULL)
+            {
+                CHECKWIN32(CloseHandle(mapping.hFileMapping) != FALSE);
+            }
+            if (mapping.hFile != INVALID_HANDLE_VALUE)
+            {
+                CHECKWIN32(CloseHandle(mapping.hFile) != FALSE);
+            }
+        }
+
+        // printf("Finished handling directory change\n");
+    }
+
+    static void CALLBACK ReadDirectoryChangesIoCompletion(DWORD dwErrorCode, DWORD dwNumberOfBytesTransferred, LPOVERLAPPED lpOverlapped)
+    {
+        RDCTask* pTask = (RDCTask*)lpOverlapped->hEvent;
+
+        // Sanity checking my knowledge about APCs. Even though it looks like an async system, it's all only happening on one thread, using APCs processed while sleeping.
+        assert(pTask->DirectoryWatcherThreadId == GetCurrentThreadId());
+
+        if (dwErrorCode == ERROR_OPERATION_ABORTED)
+        {
+            // In this case, the IO task was canceled through CancelIo(), like when the PSO watcher is getting shut down.
+            // That means this task is officially done its job.
+            *pTask->pOutstandingRDCTaskCount -= 1;
+            return;
+        }
+
+        // Handle all the file notifications that came from this IO completion
+        pTask->pPipelineSet->ProcessFileChangeNotifications(pTask->DirectoryPath.c_str(), pTask->pDirectoryChangeBuffer.get(), dwNumberOfBytesTransferred);
+
+        // Start a new RDC that will call this function again in the future
+        BOOL rdcResult = ReadDirectoryChangesW(
+            pTask->DirectoryHandle,
+            pTask->pDirectoryChangeBuffer.get(),
+            RDCTask::kDirectoryChangeBufferSize,
+            FALSE, // don't watch subdirectories
+            FILE_NOTIFY_CHANGE_LAST_WRITE,
+            NULL, // asynchronous mode
+            lpOverlapped,
+            ReadDirectoryChangesIoCompletion);
+        CHECKWIN32(rdcResult != FALSE);
+    }
+
+    static void CALLBACK DirectoryWatcherTerminateAPC(ULONG_PTR dwParam)
+    {
+        DirectoryWatcher* pDirectoryWatcher = reinterpret_cast<DirectoryWatcher*>(dwParam);
+        pDirectoryWatcher->ShouldTerminate = true;
+    }
+
+    // This function represents the thread that responds to directory change events
+    void DirectoryWatcherMain()
+    {
+        // Number of IO tasks calling ReadDirectoryChanges.
+        // Used to know when all tasks have completed and deleted themselves.
+        int outstandingRDCTaskCount = 0;
+
+        // Start an async RDC call for each directory to watch
+        // The IO Completion callback will get called when the directory changes.
+        for (const std::pair<std::wstring, HANDLE>& dir : mDirectoriesToWatch)
+        {
+            outstandingRDCTaskCount++;
+
+            mDirectoryWatcher.RDCTasks.push_back(std::make_unique<RDCTask>());
+            RDCTask* pTask = mDirectoryWatcher.RDCTasks.back().get();
+
+            pTask->DirectoryWatcherThreadId = GetCurrentThreadId(); // Just for sanity checking for APCs. Not functionally required.
+            pTask->DirectoryPath = dir.first;
+            pTask->DirectoryHandle = dir.second;
+            pTask->Overlapped.hEvent = pTask; // Use the hEvent as a userdata pointer to the task (see comments in RDCTask)
+            pTask->pOutstandingRDCTaskCount = &outstandingRDCTaskCount;
+            pTask->pDirectoryChangeBuffer = std::make_unique<char[]>(RDCTask::kDirectoryChangeBufferSize);
+            pTask->pPipelineSet = this;
+
+            // Initiate the first instance of this task
+            BOOL rdcResult = ReadDirectoryChangesW(
+                dir.second, 
+                pTask->pDirectoryChangeBuffer.get(),
+                RDCTask::kDirectoryChangeBufferSize,
+                FALSE, // don't watch subdirectories
+                FILE_NOTIFY_CHANGE_LAST_WRITE,
+                NULL, // asynchronous mode
+                &pTask->Overlapped,
+                ReadDirectoryChangesIoCompletion);
+            CHECKWIN32(rdcResult != FALSE);
+        }
+
+        // Main watcher loop
+        // RDC IO completions are handled through APCs (this thread sleeps in an alertable state)
+        // Requests to terminate the watcher are also handled through APCs.
+        while (outstandingRDCTaskCount > 0)
+        {
+            // Check if a termination request has been received but not initiated yet.
+            // If so, initiate the termination by cancelling the tasks, then wait for them all to finish (rdcTaskCount == 0)
+            if (mDirectoryWatcher.ShouldTerminate && !mDirectoryWatcher.StartedCancelling)
+            {
+                for (std::unique_ptr<RDCTask>& pTask : mDirectoryWatcher.RDCTasks)
+                {
+                    // Cancel the task's current asynchronous RDC
+                    // The watcher loop will keep running as long as the RDCs are still being cancelled, since the cancellation happens through its IO completion APC.
+                    CHECKWIN32(CancelIoEx(pTask->DirectoryHandle, &pTask->Overlapped) != FALSE);
+                }
+
+                mDirectoryWatcher.StartedCancelling = true;
+            }
+
+            SleepEx(INFINITE, TRUE);
+        }
+
+        // Boy scout rules!
+        mDirectoryWatcher.RDCTasks.clear();
     }
 
     // Creates a threadpool task that initially builds all the pipelines and stuff.
@@ -1403,7 +1555,7 @@ public:
     void UpdatePipelines() override
     {
         // If the initial BuildAllAsync() hasn't finished yet, then just return straight away.
-        bool buildAllAsyncDone = WaitForSingleObjectEx(mhBuildAsyncEvent, 0, FALSE) == WAIT_OBJECT_0;
+        bool buildAllAsyncDone = mhBuildAsyncEvent != NULL && WaitForSingleObjectEx(mhBuildAsyncEvent, 0, FALSE) == WAIT_OBJECT_0;
         if (!buildAllAsyncDone)
         {
             return;
