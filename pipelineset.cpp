@@ -233,9 +233,6 @@ class PipelineSet : public IPipelineSet
     // Used by the DirectoryWatcherThread.
     struct RDCTask
     {
-        // Just for sanity checking for APCs. Not functionally required.
-        DWORD DirectoryWatcherThreadId;
-
         // The directory for which this task is looking at changes.
         std::wstring DirectoryPath;
         HANDLE DirectoryHandle;
@@ -449,19 +446,20 @@ public:
         }
 
         // Copy out the input layout, since it's passed by reference
-
-        // 16 is a typical maximum for input layout elements.
-        assert(desc.InputLayout.NumElements <= 16);
-        if (desc.InputLayout.NumElements > 16)
+        if (desc.InputLayout.pInputElementDescs != NULL)
         {
-            // I still have an emergency fallback so things don't crash in the worst case.
-            mPipelines.back().PipelineStateDesc.InputLayout.pInputElementDescs = new D3D12_INPUT_ELEMENT_DESC[desc.InputLayout.NumElements];
+            // 16 is a typical maximum for input layout elements.
+            if (desc.InputLayout.NumElements > 16)
+            {
+                // I still have an emergency fallback so things don't crash in the worst case.
+                mPipelines.back().PipelineStateDesc.InputLayout.pInputElementDescs = new D3D12_INPUT_ELEMENT_DESC[desc.InputLayout.NumElements];
+            }
+            else
+            {
+                mPipelines.back().PipelineStateDesc.InputLayout.pInputElementDescs = &mPipelines.back().InputElementDescStorage[0];
+            }
+            std::copy_n(desc.InputLayout.pInputElementDescs, desc.InputLayout.NumElements, const_cast<D3D12_INPUT_ELEMENT_DESC*>(mPipelines.back().PipelineStateDesc.InputLayout.pInputElementDescs));
         }
-        else
-        {
-            mPipelines.back().PipelineStateDesc.InputLayout.pInputElementDescs = &mPipelines.back().InputElementDescStorage[0];
-        }
-        std::copy_n(desc.InputLayout.pInputElementDescs, desc.InputLayout.NumElements, const_cast<D3D12_INPUT_ELEMENT_DESC*>(mPipelines.back().PipelineStateDesc.InputLayout.pInputElementDescs));
 
         retval.second = &mPipelines.back().pPublicPtr;
 
@@ -1421,9 +1419,6 @@ public:
     {
         RDCTask* pTask = (RDCTask*)lpOverlapped->hEvent;
 
-        // Sanity checking my knowledge about APCs. Even though it looks like an async system, it's all only happening on one thread, using APCs processed while sleeping.
-        assert(pTask->DirectoryWatcherThreadId == GetCurrentThreadId());
-
         if (dwErrorCode == ERROR_OPERATION_ABORTED)
         {
             // In this case, the IO task was canceled through CancelIo(), like when the PSO watcher is getting shut down.
@@ -1470,7 +1465,6 @@ public:
             mDirectoryWatcher.RDCTasks.push_back(std::make_unique<RDCTask>());
             RDCTask* pTask = mDirectoryWatcher.RDCTasks.back().get();
 
-            pTask->DirectoryWatcherThreadId = GetCurrentThreadId(); // Just for sanity checking for APCs. Not functionally required.
             pTask->DirectoryPath = dir.first;
             pTask->DirectoryHandle = dir.second;
             pTask->Overlapped.hEvent = pTask; // Use the hEvent as a userdata pointer to the task (see comments in RDCTask)
