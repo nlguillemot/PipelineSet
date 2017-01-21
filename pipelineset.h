@@ -110,10 +110,11 @@ public:
     // After calling BuildAllAsync(), you are no longer allowed to call AddPipeline to add more pipelines. It's closed.
     virtual HANDLE BuildAllAsync() = 0;
 
-    // The IPipelineSet will automatically check the timestamps of the root signature/shader files it depends on,
+    // The IPipelineSet will automatically get file change notifications for the root signature/shader files it depends on,
     // and once it sees them change it'll rebuild the affected root signatures and pipeline states.
     // In order to prevent RS/PSOs to switch out from under your feet mid-frame,
     // the changes are only committed when you call UpdatePipelines().
-    // That means you should call UpdatePipelines() perhaps once per frame, at the start of the frame.
+    // You should call UpdatePipelines() once per frame, at the start of the frame.
+    // This is because each UpdatePipelines() also garbage collects old PSOs after maximumFrameLatency frames passed.
     virtual void UpdatePipelines() = 0;
 };

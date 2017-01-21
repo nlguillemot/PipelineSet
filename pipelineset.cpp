@@ -569,7 +569,7 @@ public:
             DWORD fullPathResult = GetFullPathNameW(shaderFilename->c_str(), fullPathLengthPlusOne, fullPathBuffer.get(), &lpFilePart);
             CHECKWIN32(fullPathResult < fullPathLengthPlusOne); // the copy to the buffer should succeed
 
-                                                                // add the shader file to the list of shader files
+            // add the shader file to the list of shader files
             bool inserted;
             std::map<std::wstring, ReloadableShader>::iterator it;
             std::tie(it, inserted) = mFileToShader.emplace(fullPathBuffer.get(), ReloadableShader{});
