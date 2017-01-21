@@ -20,6 +20,12 @@ struct GraphicsPipelineFiles
     std::wstring GSFile;
 };
 
+struct ComputePipelineFiles
+{
+    std::wstring RSFile;
+    std::wstring CSFile;
+};
+
 // FEATURES OVERVIEW
 // -----------------
 // IPipelineSet manages a set of pipeline state objects. You may ask, "Why?":
@@ -96,6 +102,7 @@ public:
     //     ID3D12PipelineState** ppPSO;
     //     std::tie(ppRS, ppPSO) = pPipelineSet->AddPipeline(pipelineDesc, pipelineFiles);
     virtual std::pair<ID3D12RootSignature**, ID3D12PipelineState**> AddPipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const GraphicsPipelineFiles& files) = 0;
+    virtual std::pair<ID3D12RootSignature**, ID3D12PipelineState**> AddPipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, const ComputePipelineFiles& files) = 0;
 
     // Call this after having called AddPipeline() for all the pipelines in the set.
     // This will start building the root signature and PSOs necessary for the PipelineSet.
