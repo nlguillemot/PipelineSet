@@ -1,9 +1,15 @@
 #pragma once
 
-#include <d3d12.h>
-
 #include <string>
 #include <memory>
+#include <utility>
+
+struct ID3D12Device;
+struct ID3D12RootSignature;
+struct ID3D12PipelineState;
+
+struct D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+struct D3D12_COMPUTE_PIPELINE_STATE_DESC;
 
 // An extension of the PSO desc that lets you specify a filename from which to read the root signature and shader bytecodes.
 // The IPipelineSet will use these filenames in order to build the ID3D12RootSignatures and ID3D12PipelineStates.
@@ -108,7 +114,7 @@ public:
     // This will start building the root signature and PSOs necessary for the PipelineSet.
     // When the build is done, the returned event HANDLE will be set.
     // After calling BuildAllAsync(), you are no longer allowed to call AddPipeline to add more pipelines. It's closed.
-    virtual HANDLE BuildAllAsync() = 0;
+    /* note: returns HANDLE */ virtual void* BuildAllAsync() = 0;
 
     // The IPipelineSet will automatically get file change notifications for the root signature/shader files it depends on,
     // and once it sees them change it'll rebuild the affected root signatures and pipeline states.

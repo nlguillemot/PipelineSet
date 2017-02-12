@@ -1,5 +1,7 @@
 #include "pipelineset.h"
 
+#include <d3d12.h>
+
 // Used to concatenate paths
 #include <Pathcch.h>
 
