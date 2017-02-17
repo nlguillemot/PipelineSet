@@ -147,6 +147,13 @@ class PipelineSet : public IPipelineSet
     // To counter this, I delete PSOs only after a number of updates corresponding to the maximum latency have passed.
     int mMaximumFrameLatency;
 
+    // Used to initialize the PSO's and RS's NodeMask
+    uint32_t mNodeMask;
+
+    // Ensures only one thread is adding to the pipeline state at a time.
+    // This effectively makes the AddPipeline function thread-safe.
+    std::mutex mAdditionMutex;
+
     // You're not allowed to add more pipelines after calling BuildAllAsync(),
     // and this flag is used to make sure of that.
     bool mClosedForAddition = false;
@@ -183,20 +190,24 @@ class PipelineSet : public IPipelineSet
 
         ReloadablePipelineState() = default;
 
-        static ReloadablePipelineState Graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const GraphicsPipelineFiles& files)
+        static ReloadablePipelineState Graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const GraphicsPipelineFiles& files, uint32_t nodeMask)
         {
             ReloadablePipelineState ps{};
             ps.Type = PT_Graphics;
             ps.GfxPipelineStateDesc = desc;
+            assert(ps.GfxPipelineStateDesc.NodeMask == 0);
+            ps.GfxPipelineStateDesc.NodeMask = nodeMask;
             ps.GfxFiles = files;
             return ps;
         }
 
-        static ReloadablePipelineState Compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, const ComputePipelineFiles& files)
+        static ReloadablePipelineState Compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, const ComputePipelineFiles& files, uint32_t nodeMask)
         {
             ReloadablePipelineState ps{};
             ps.Type = PT_Compute;
             ps.ComputePipelineStateDesc = desc;
+            assert(ps.ComputePipelineStateDesc.NodeMask == 0);
+            ps.ComputePipelineStateDesc.NodeMask = nodeMask;
             ps.ComputeFiles = files;
             return ps;
         }
@@ -332,9 +343,10 @@ class PipelineSet : public IPipelineSet
     bool mDidInitialCommit = false;
 
 public:
-    explicit PipelineSet(ID3D12Device* pDevice, int maximumFrameLatency)
+    explicit PipelineSet(ID3D12Device* pDevice, int maximumFrameLatency, uint32_t nodeMask)
         : mpDevice(pDevice)
         , mMaximumFrameLatency(maximumFrameLatency)
+        , mNodeMask(nodeMask)
     { }
 
     ~PipelineSet()
@@ -416,12 +428,12 @@ public:
 
     std::pair<ID3D12RootSignature**, ID3D12PipelineState**> AddPipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const GraphicsPipelineFiles& files) override
     {
-        return AddPipeline_Common(ReloadablePipelineState::Graphics(desc, files), desc.pRootSignature, files.RSFile);
+        return AddPipeline_Common(ReloadablePipelineState::Graphics(desc, files, mNodeMask), desc.pRootSignature, files.RSFile);
     }
 
     std::pair<ID3D12RootSignature**, ID3D12PipelineState**> AddPipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, const ComputePipelineFiles& files) override
     {
-        return AddPipeline_Common(ReloadablePipelineState::Compute(desc, files), desc.pRootSignature, files.RSFile);
+        return AddPipeline_Common(ReloadablePipelineState::Compute(desc, files, mNodeMask), desc.pRootSignature, files.RSFile);
     }
 
     // Common code between AddPipeline for graphics and compute
@@ -430,6 +442,8 @@ public:
         ID3D12RootSignature* pRootSignature,
         const std::wstring& rsFile)
     {
+        std::lock_guard<std::mutex> addPipelineLock(mAdditionMutex);
+
         std::pair<ID3D12RootSignature**, ID3D12PipelineState**> retval{ nullptr, nullptr };
 
         assert(!mClosedForAddition);
@@ -571,7 +585,7 @@ public:
             DWORD fullPathResult = GetFullPathNameW(shaderFilename->c_str(), fullPathLengthPlusOne, fullPathBuffer.get(), &lpFilePart);
             CHECKWIN32(fullPathResult < fullPathLengthPlusOne); // the copy to the buffer should succeed
 
-                                                                // add the shader file to the list of shader files
+            // add the shader file to the list of shader files
             bool inserted;
             std::map<std::wstring, ReloadableShader>::iterator it;
             std::tie(it, inserted) = mFileToShader.emplace(fullPathBuffer.get(), ReloadableShader{});
@@ -740,7 +754,7 @@ public:
 
             // Attempt to create the root signature
             ID3D12RootSignature* pRootSignature;
-            HRESULT hr = mpDevice->CreateRootSignature(0, mapping.pData, mapping.DataSize.QuadPart, IID_PPV_ARGS(&pRootSignature));
+            HRESULT hr = mpDevice->CreateRootSignature(mNodeMask, mapping.pData, mapping.DataSize.QuadPart, IID_PPV_ARGS(&pRootSignature));
             if (SUCCEEDED(hr))
             {
                 // It succeeded! Hold on to it.
@@ -1255,7 +1269,7 @@ public:
                 ID3D12RootSignature* pRootSignature = NULL;
                 if (!failed)
                 {
-                    HRESULT hr = mpDevice->CreateRootSignature(0, mapping.pData, mapping.DataSize.QuadPart, IID_PPV_ARGS(&pRootSignature));
+                    HRESULT hr = mpDevice->CreateRootSignature(mNodeMask, mapping.pData, mapping.DataSize.QuadPart, IID_PPV_ARGS(&pRootSignature));
                     if (FAILED(hr))
                     {
                         // It failed, so report an error message and leave the ReloadableRootSignature as NULL.
@@ -1857,7 +1871,7 @@ public:
     }
 };
 
-std::shared_ptr<IPipelineSet> IPipelineSet::Create(ID3D12Device* pDevice, int maximumFrameLatency)
+std::shared_ptr<IPipelineSet> IPipelineSet::Create(ID3D12Device* pDevice, int maximumFrameLatency, uint32_t nodeMask)
 {
-    return std::make_shared<PipelineSet>(pDevice, maximumFrameLatency);
+    return std::make_shared<PipelineSet>(pDevice, maximumFrameLatency, nodeMask);
 }

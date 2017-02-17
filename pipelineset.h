@@ -3,6 +3,7 @@
 #include <string>
 #include <memory>
 #include <utility>
+#include <cstdint>
 
 struct ID3D12Device;
 struct ID3D12RootSignature;
@@ -96,7 +97,8 @@ class IPipelineSet
 {
 public:
     // Create the PipelineSet which will use the passed-in device to create its pipelines and root signatures.
-    static std::shared_ptr<IPipelineSet> Create(ID3D12Device* pDevice, int maximumFrameLatency);
+    // The nodeMask is used for creating PSOs and root signatures. You should leave the NodeMask in your PSO descs to 0.
+    static std::shared_ptr<IPipelineSet> Create(ID3D12Device* pDevice, int maximumFrameLatency, uint32_t nodeMask);
 
     // Adds a pipeline to the set and returns ptrptrs that will eventually be filled with meaningful pointers.
     // They'll only get filled-in at the next call to UpdatePipelines() after the pipelines have been created (or reloaded).
