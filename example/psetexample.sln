@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 15
+VisualStudioVersion = 15.0.26730.15
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "psetexample", "psetexample.vcxproj", "{0C6095C2-1D03-4F59-B08C-C4E2C3655DA7}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0C6095C2-1D03-4F59-B08C-C4E2C3655DA7}.Debug|x64.ActiveCfg = Debug|x64
+		{0C6095C2-1D03-4F59-B08C-C4E2C3655DA7}.Debug|x64.Build.0 = Debug|x64
+		{0C6095C2-1D03-4F59-B08C-C4E2C3655DA7}.Release|x64.ActiveCfg = Release|x64
+		{0C6095C2-1D03-4F59-B08C-C4E2C3655DA7}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {C32B6D04-9C2A-4F0B-8FC1-937716BD39BC}
+	EndGlobalSection
+EndGlobal
