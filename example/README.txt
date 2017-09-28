@@ -1,4 +1,5 @@
-#How to use this example project
+How to use this example project
+====================
 
 It should mostly "just work" to open the solution and run it.
 
